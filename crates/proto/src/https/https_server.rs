@@ -24,13 +24,10 @@ use crate::https::HttpsError;
 ///
 /// To allow downstream clients to do something interesting with the lifetime of the bytes, this doesn't
 ///   perform a conversion to a Message, only collects all the bytes.
-pub async fn message_from<R>(
+pub async fn message_from(
     this_server_name: Option<Arc<str>>,
-    request: Request<R>,
-) -> Result<BytesMut, HttpsError>
-where
-    R: Stream<Item = Result<Bytes, h2::Error>> + 'static + Send + Debug + Unpin,
-{
+    request: Request<h2::RecvStream>,
+) -> Result<BytesMut, HttpsError> {
     debug!("Received request: {:#?}", request);
 
     let this_server_name = this_server_name.as_deref();
@@ -55,18 +52,24 @@ where
 }
 
 /// Deserialize the message from a POST message
-pub(crate) async fn message_from_post<R>(
-    mut request_stream: R,
+pub(crate) async fn message_from_post(
+    mut request_stream: h2::RecvStream,
     length: Option<usize>,
-) -> Result<BytesMut, HttpsError>
-where
-    R: Stream<Item = Result<Bytes, h2::Error>> + 'static + Send + Debug + Unpin,
-{
+) -> Result<BytesMut, HttpsError> {
     let mut bytes = BytesMut::with_capacity(length.unwrap_or(0).clamp(512, 4096));
 
     loop {
         match request_stream.next().await {
-            Some(Ok(mut frame)) => bytes.extend_from_slice(&frame.split_off(0)),
+            Some(Ok(mut frame)) => {
+                if request_stream
+                    .flow_control()
+                    .release_capacity(frame.len())
+                    .is_err()
+                {
+                    return Err("cannot release flow control buffer".into());
+                }
+                bytes.extend_from_slice(&frame.split_off(0))
+            }
             Some(Err(err)) => return Err(err.into()),
             None => {
                 return if let Some(length) = length {
